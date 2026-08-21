@@ -2,6 +2,9 @@ name = "tg-storage"
 main = "worker.js"
 compatibility_date = "2024-12-01"
 
+# 防止部署时清空 Dashboard 上手动设置的变量
+keep_vars = true
+
 # 部署后在 Cloudflare Dashboard 设置 Secrets:
 # BOT_TOKEN, CHAT_ID, STORE_KEY
 #
