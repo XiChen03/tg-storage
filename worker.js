@@ -64,11 +64,29 @@ async function handleUpload(request, env) {
         const fd2 = await fr.json();
         if (fd2.ok) filePath = fd2.result.file_path;
       } catch (_) {}
-      return json({
+      // 提取缩略图（图片/视频 TG 自动生成）
+      let thumbFid = null, thumbFp = null, thumbMid = null;
+      const thumb = (r.photo ? r.photo.reduce((a, b) => a.file_size < b.file_size ? a : b) : null)
+        || (r.video && r.video.thumb) || (r.animation && r.animation.thumb);
+      if (thumb && thumb.file_id) {
+        thumbFid = thumb.file_id;
+        try {
+          const tfr = await fetch(base + '/bot' + env.BOT_TOKEN + '/getFile?file_id=' + thumbFid);
+          const tfd = await tfr.json();
+          if (tfd.ok) thumbFp = tfd.result.file_path;
+        } catch (_) {}
+      }
+      const resp2 = {
         ok: true, file_id: fi.file_id, file_path: filePath,
         message_id: r.message_id, mime: mime,
         filename: file.name, size: fi.file_size || file.size,
-      });
+      };
+      if (thumbFid) {
+        resp2.thumb_fid = thumbFid;
+        resp2.thumb_fp = thumbFp;
+        thumbMid = r.message_id;
+      }
+      return json(resp2);
     } catch (e) {
       lastErr = e;
       if (i < MAX_RETRIES - 1) await sleep(1000 * (i + 1));
@@ -83,6 +101,17 @@ async function handleDownload(fileId, request, env) {
     return json({ error: 'invalid id' }, 400);
   const manifest = await fetchManifest(fileId, env);
   if (!manifest) return json({ error: 'not found' }, 404);
+  const url = new URL(request.url);
+  const wantThumb = url.searchParams.get('thumb') === '1';
+  if (wantThumb && manifest.thumb_fid) {
+    const buf = await fetchTgFile(manifest.thumb_fid, manifest.thumb_fp, env);
+    if (!buf) return json({ error: 'thumb fetch failed' }, 504);
+    const h = new Headers();
+    h.set('Content-Type', manifest.mime || 'image/jpeg');
+    h.set('Cache-Control', 'public, max-age=604800, immutable');
+    h.set('Content-Length', String(buf.byteLength));
+    return new Response(buf, { status: 200, headers: h });
+  }
   const total = manifest.size || 0;
   const mime = manifest.mime || 'application/octet-stream';
   const fname = encodeURIComponent(manifest.filename || fileId);
