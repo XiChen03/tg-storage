@@ -200,7 +200,7 @@ async function fetchTgFile(fileId, filePath, env) {
     if (!d.ok) return null;
     fp = d.result.file_path;
   }
-  const r = await fetch(base + '/bot' + env.BOT_TOKEN + '/' + fp);
+  const r = await fetch(base + '/file/bot' + env.BOT_TOKEN + '/' + fp);
   if (!r.ok) return null;
   return new Uint8Array(await r.arrayBuffer());
 }
