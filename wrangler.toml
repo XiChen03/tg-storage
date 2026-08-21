@@ -1,0 +1,10 @@
+name = "tg-storage"
+main = "worker.js"
+compatibility_date = "2024-12-01"
+
+# 部署后在 Cloudflare Dashboard 设置 Secrets:
+# BOT_TOKEN, CHAT_ID, STORE_KEY
+#
+# 环境变量(Environment Variables):
+# ORIGIN_URL = https://xywm.ltd    (你的 XingyueBot 域名)
+# TG_API_URL = https://api.telegram.org  (可选，默认官方；可改为反代域名)
