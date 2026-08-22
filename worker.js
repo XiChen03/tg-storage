@@ -145,18 +145,22 @@ async function handleDownload(fileId, request, env) {
     async start(controller) {
       try {
         let pos = 0;
+        const sized = chunks.every(c => typeof c.size === 'number' && c.size >= 0);
         for (const c of chunks) {
-          // 用累计偏移定位，兼容任意分片大小（旧 16MB / 新 19.5MB）
-          const cStart = pos;
-          const cEnd = cStart + c.size - 1;
-          if (rng && (cEnd < rng.start || cStart > rng.end)) { pos += c.size; continue; }
+          // 累计偏移定位；极早期清单缺 size 字段时退化为逐片取回、按真实字节推进
+          if (rng) {
+            if (sized) {
+              const cStart = pos, cEnd = cStart + c.size - 1;
+              if (cEnd < rng.start || cStart > rng.end) { pos += c.size; continue; }
+              if (pos > rng.end) break;
+            } else if (pos > rng.end) break;
+          }
           const buf = await fetchTgFileWithRetry(c.fid, c.filePath, env, 3);
-          if (!buf) throw new Error('chunk ' + c.index + ' failed');
+          if (!buf) throw new Error('chunk ' + (c.index != null ? c.index : '?') + ' failed');
           const s = rng ? Math.max(0, rng.start - pos) : 0;
           const e = rng ? Math.min(buf.byteLength, rng.end - pos + 1) : buf.byteLength;
           if (s < e) controller.enqueue(buf.slice(s, e));
-          pos += c.size;
-          if (rng && pos > rng.end) break;
+          pos += (typeof c.size === 'number') ? c.size : buf.byteLength;
         }
         controller.close();
       } catch (err) { controller.error(err); }
@@ -222,16 +226,18 @@ async function fetchManifest(fileId, env) {
 
 async function fetchTgFile(fileId, filePath, env) {
   const base = env.TG_API_URL || 'https://api.telegram.org';
+  const dl = async (fp) => {
+    const r = await fetch(base + '/file/bot' + env.BOT_TOKEN + '/' + fp);
+    if (!r.ok) return null;
+    return new Uint8Array(await r.arrayBuffer());
+  };
   let fp = filePath;
-  if (!fp) {
-    const r = await fetch(base + '/bot' + env.BOT_TOKEN + '/getFile?file_id=' + fileId);
-    const d = await r.json();
-    if (!d.ok) return null;
-    fp = d.result.file_path;
-  }
-  const r = await fetch(base + '/file/bot' + env.BOT_TOKEN + '/' + fp);
-  if (!r.ok) return null;
-  return new Uint8Array(await r.arrayBuffer());
+  if (fp) { const b = await dl(fp); if (b) return b; }
+  // 缓存的 file_path 失效/为空 → 强制重新 getFile 获取新路径
+  const r = await fetch(base + '/bot' + env.BOT_TOKEN + '/getFile?file_id=' + fileId);
+  const d = await r.json();
+  if (!d.ok) return null;
+  return await dl(d.result.file_path);
 }
 
 async function fetchTgFileWithRetry(fileId, filePath, env, retries) {
