@@ -120,7 +120,7 @@ async function handleDownload(fileId, request, env) {
   const ifNM = request.headers.get('If-None-Match');
   if (ifNM && ifNM === et)
     return new Response(null, { status: 304, headers: { 'ETag': et, 'Cache-Control': 'public, max-age=31536000' } });
-  const rng = parseRange(request.headers.get('Range'), total);
+  let rng = parseRange(request.headers.get('Range'), total);
   const chunks = manifest.chunks || [];
   if (chunks.length <= 1) {
     const fid = chunks.length === 1 ? chunks[0].fid : manifest.file_id;
@@ -159,6 +159,16 @@ async function handleDownload(fileId, request, env) {
           }
           needed.push({ c: c, pos: pos });
           pos += (typeof c.size === 'number') ? c.size : 0;
+        }
+        // 子请求预算：单次调用最多取 MAXC 片（50 上限 - manifest - 重试余量），
+        // 超出则在本片边界截断，以 206 Partial Content 返回；浏览器/下载器会
+        // 自动携带后续 Range 请求继续取，等效无感分页
+        const MAXC = 45;
+        if (sized && needed.length > MAXC) {
+          if (!rng) rng = { start: 0, end: total - 1 };
+          const cutEnd = needed[MAXC - 1].pos + needed[MAXC - 1].c.size - 1;
+          rng = { start: rng.start, end: Math.min(rng.end, cutEnd) };
+          needed.length = MAXC;
         }
         // 滑动窗口流水线：最多 CONC 片在途，取到一片立即写入流并释放，
         // 内存峰值恒定（约4片），不会像整段缓冲那样撑爆 128MB 内存上限；
