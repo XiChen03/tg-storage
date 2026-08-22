@@ -146,8 +146,10 @@ async function handleDownload(fileId, request, env) {
       try {
         let pos = 0;
         const sized = chunks.every(c => typeof c.size === 'number' && c.size >= 0);
+        const hasPath = chunks.every(c => c.filePath);
+        // 收集需要的分片
+        const needed = [];
         for (const c of chunks) {
-          // 累计偏移定位；极早期清单缺 size 字段时退化为逐片取回、按真实字节推进
           if (rng) {
             if (sized) {
               const cStart = pos, cEnd = cStart + c.size - 1;
@@ -155,12 +157,31 @@ async function handleDownload(fileId, request, env) {
               if (pos > rng.end) break;
             } else if (pos > rng.end) break;
           }
-          const buf = await fetchTgFileWithRetry(c.fid, c.filePath, env, 3);
-          if (!buf) throw new Error('chunk ' + (c.index != null ? c.index : '?') + ' failed');
-          const s = rng ? Math.max(0, rng.start - pos) : 0;
-          const e = rng ? Math.min(buf.byteLength, rng.end - pos + 1) : buf.byteLength;
+          needed.push({ c: c, pos: pos });
+          pos += (typeof c.size === 'number') ? c.size : 0;
+        }
+        // 滑动窗口流水线：最多 CONC 片在途，取到一片立即写入流并释放，
+        // 内存峰值恒定（约4片），不会像整段缓冲那样撑爆 128MB 内存上限；
+        // 老清单无 filePath 时每片要先 getFile，退化串行避免子请求翻倍
+        const CONC = hasPath ? 4 : 1;
+        const pending = new Map();
+        let cursor = 0;
+        const fill = () => {
+          while (cursor < needed.length && pending.size < CONC) {
+            const idx = cursor++;
+            const c = needed[idx].c;
+            pending.set(idx, fetchTgFileWithRetry(c.fid, c.filePath, env, 3));
+          }
+        };
+        fill();
+        for (let i = 0; i < needed.length; i++) {
+          const buf = await pending.get(i);
+          pending.delete(i);
+          fill();
+          if (!buf) throw new Error('chunk ' + (needed[i].c.index != null ? needed[i].c.index : '?') + ' failed');
+          const s = rng ? Math.max(0, rng.start - needed[i].pos) : 0;
+          const e = rng ? Math.min(buf.byteLength, rng.end - needed[i].pos + 1) : buf.byteLength;
           if (s < e) controller.enqueue(buf.slice(s, e));
-          pos += (typeof c.size === 'number') ? c.size : buf.byteLength;
         }
         controller.close();
       } catch (err) { controller.error(err); }
