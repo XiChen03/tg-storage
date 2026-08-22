@@ -251,12 +251,22 @@ async function fetchTgFileWithRetry(fileId, filePath, env, retries) {
 
 function parseRange(header, total) {
   if (!header || total <= 0) return null;
-  const m = header.match(/bytes=(\d+)-(\d*)/);
-  if (!m) return null;
-  const start = parseInt(m[1]);
-  const end = m[2] ? parseInt(m[2]) : total - 1;
-  if (start >= total || end >= total || start > end) return null;
-  return { start: start, end: end };
+  // bytes=N-M（标准范围）
+  let m = header.match(/bytes=(\d+)-(\d*)/);
+  if (m) {
+    const start = parseInt(m[1]);
+    const end = m[2] ? parseInt(m[2]) : total - 1;
+    if (start >= total || end >= total || start > end) return null;
+    return { start: start, end: end };
+  }
+  // bytes=-N（Safari/iOS 探测 moov atom 用的后缀范围）
+  m = header.match(/bytes=-(\d+)/);
+  if (m) {
+    const suffix = parseInt(m[1]);
+    if (suffix <= 0 || suffix > total) return null;
+    return { start: total - suffix, end: total - 1 };
+  }
+  return null;
 }
 
 function makeEtag(manifest) {
