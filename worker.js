@@ -1,5 +1,4 @@
 const MAX_RETRIES = 3;
-const CHUNK_SIZE = 16 * 1024 * 1024;
 
 export default {
   async fetch(request, env) {
@@ -147,7 +146,8 @@ async function handleDownload(fileId, request, env) {
       try {
         let pos = 0;
         for (const c of chunks) {
-          const cStart = c.index * CHUNK_SIZE;
+          // 用累计偏移定位，兼容任意分片大小（旧 16MB / 新 19.5MB）
+          const cStart = pos;
           const cEnd = cStart + c.size - 1;
           if (rng && (cEnd < rng.start || cStart > rng.end)) { pos += c.size; continue; }
           const buf = await fetchTgFileWithRetry(c.fid, c.filePath, env, 3);
