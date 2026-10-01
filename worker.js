@@ -37,7 +37,7 @@ async function handleUpload(request, env) {
   if (!file) return json({ error: 'no file' }, 400);
   const ext = (file.name || 'file').split('.').pop().toLowerCase();
   const mime = file.type || 'application/octet-stream';
-  const m = resolveMethod(mime, ext);
+  const m = resolveMethod(mime, ext, file.name);
   let lastErr;
   for (let i = 0; i < MAX_RETRIES; i++) {
     try {
@@ -236,14 +236,14 @@ async function handleDelete(fileId, request, env) {
 }
 
 // ===================== HELPERS =====================
-function resolveMethod(mime, ext) {
+function resolveMethod(mime, ext, origName) {
   if (ext === 'gif' || ext === 'webp')
-    return { method: 'sendAnimation', typeName: 'animation', outName: (ext === 'gif' ? 'a.gif' : 'a.webp').replace(/\.\w+$/, '.jpeg') };
+    return { method: 'sendAnimation', typeName: 'animation', outName: (origName && /\.(gif|webp)$/i.test(origName)) ? origName : ((ext === 'gif' ? 'a.gif' : 'a.webp').replace(/\.\w+$/, '.jpeg')) };
   if (mime.startsWith('video/'))
-    return { method: 'sendVideo', typeName: 'video', outName: 'v.mp4' };
+    return { method: 'sendVideo', typeName: 'video', outName: (origName && /\.\w+$/.test(origName)) ? origName : 'v.mp4' };
   if (mime.startsWith('audio/'))
-    return { method: 'sendAudio', typeName: 'audio', outName: 'a.mp3' };
-  return { method: 'sendDocument', typeName: 'document', outName: 'f.' + ext };
+    return { method: 'sendAudio', typeName: 'audio', outName: (origName && /\.\w+$/.test(origName)) ? origName : 'a.mp3' };
+  return { method: 'sendDocument', typeName: 'document', outName: (origName && /\.\w+$/.test(origName)) ? origName : ('f.' + ext) };
 }
 
 async function fetchManifest(fileId, env) {
