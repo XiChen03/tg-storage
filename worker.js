@@ -1,4 +1,4 @@
-const MAX_RETRIES = 3;
+const MAX_RETRIES_DEFAULT = 3;
 
 export default {
   async fetch(request, env) {
@@ -31,6 +31,17 @@ export default {
 };
 
 // ===================== UPLOAD =====================
+// Telegram 限流（429）要按 retry_after 精确等待，提前重试会延长惩罚时间。
+// 这里把 429 单独识别出来，并把退避信号透传给前端，让前端整体降速。
+function tgRetryAfter(data) {
+  const p = data && data.parameters;
+  const n = p && (p.retry_after != null ? p.retry_after : p.migrate_to_chat_id);
+  return (typeof n === 'number' && n > 0) ? n : 0;
+}
+function isTgRateLimited(description) {
+  return /too many requests|flood|retry after/i.test(description || '');
+}
+
 async function handleUpload(request, env) {
   if (request.headers.get('X-Store-Key') !== env.STORE_KEY)
     return json({ error: 'unauthorized' }, 401);
@@ -40,7 +51,8 @@ async function handleUpload(request, env) {
   const ext = (file.name || 'file').split('.').pop().toLowerCase();
   const mime = file.type || 'application/octet-stream';
   const m = resolveMethod(mime, ext, file.name);
-  let lastErr;
+  const MAX_RETRIES = env.UPLOAD_RETRIES ? (parseInt(env.UPLOAD_RETRIES, 10) || MAX_RETRIES_DEFAULT) : MAX_RETRIES_DEFAULT;
+  let lastErr, lastRetryAfter = 0;
   for (let i = 0; i < MAX_RETRIES; i++) {
     try {
       const tgFd = new FormData();
@@ -53,7 +65,18 @@ async function handleUpload(request, env) {
         method: 'POST', body: tgFd
       });
       const data = await resp.json();
-      if (!data.ok) throw new Error(data.description || 'TG API error');
+      if (!data.ok) {
+        // 429：按 retry_after 精确等待（另加 0.5s 余量），并把信号记下来透传
+        const ra = tgRetryAfter(data);
+        const desc = data.description || 'TG API error';
+        if (ra > 0 || isTgRateLimited(desc)) {
+          lastRetryAfter = ra || 5;
+          lastErr = new Error(desc);
+          if (i < MAX_RETRIES - 1) { await sleep(lastRetryAfter * 1000 + 500); continue; }
+          return json({ error: 'rate limited: ' + desc, rateLimited: true, retryAfter: lastRetryAfter }, 429);
+        }
+        throw new Error(desc);
+      }
       const r = data.result || {};
       let fi = pickFile(r);
       if (!fi && m.method !== 'sendDocument') {
@@ -65,7 +88,11 @@ async function handleUpload(request, env) {
           method: 'POST', body: docFd
         });
         const data2 = await resp2.json();
-        if (!data2.ok) throw new Error(data2.description || 'TG API error');
+        if (!data2.ok) {
+          const ra2 = tgRetryAfter(data2);
+          if (ra2 > 0) return json({ error: 'rate limited', rateLimited: true, retryAfter: ra2 }, 429);
+          throw new Error(data2.description || 'TG API error');
+        }
         const r2 = data2.result || {};
         const fi2 = pickFile(r2);
         if (!fi2) throw new Error('unexpected response (fields: ' + Object.keys(r2).join(',') + ')');
@@ -107,10 +134,16 @@ async function handleUpload(request, env) {
       return json(resp2);
     } catch (e) {
       lastErr = e;
-      if (i < MAX_RETRIES - 1) await sleep(1000 * (i + 1));
+      if (i < MAX_RETRIES - 1) {
+        // 普通错误（网络抖动等）指数退避；限流已在上面的分支里按 retry_after 等待
+        const wait = lastRetryAfter > 0 ? lastRetryAfter * 1000 + 500 : 1000 * (i + 1);
+        await sleep(wait);
+      }
     }
   }
-  return json({ error: 'upload failed: ' + lastErr.message }, 500);
+  const body = { error: 'upload failed: ' + (lastErr ? lastErr.message : 'unknown') };
+  if (lastRetryAfter > 0) { body.rateLimited = true; body.retryAfter = lastRetryAfter; }
+  return json(body, lastRetryAfter > 0 ? 429 : 500);
 }
 
 // ===================== DOWNLOAD =====================
@@ -182,7 +215,7 @@ async function handleDownload(fileId, request, env) {
         // 子请求预算：单次调用最多取 MAXC 片（50 上限 - manifest - 重试余量），
         // 超出则在本片边界截断，以 206 Partial Content 返回；浏览器/下载器会
         // 自动携带后续 Range 请求继续取，等效无感分页
-        const MAXC = 45;
+        const MAXC = env.DOWNLOAD_MAX_CHUNKS ? Math.max(5, Math.min(48, parseInt(env.DOWNLOAD_MAX_CHUNKS, 10) || 45)) : 45;
         if (sized && needed.length > MAXC) {
           if (!rng) rng = { start: 0, end: total - 1 };
           const cutEnd = needed[MAXC - 1].pos + needed[MAXC - 1].c.size - 1;
@@ -309,11 +342,33 @@ function pickFile(r) {
 
 async function fetchManifest(fileId, env) {
   const key = 'tgstore/' + fileId + '.json';
-  const resp = await fetch(env.ORIGIN_URL + '/' + key, {
-    headers: { 'X-Store-Key': env.STORE_KEY }
-  });
+  const url = env.ORIGIN_URL + '/' + key;
+  // 清单很少变化，用 Cloudflare 边缘缓存把每次下载前的这次 ORIGIN 往返省掉。
+  // 命中缓存时可省 1-3 个 RTT，云储存视频的首帧明显更快。
+  const cache = typeof caches !== 'undefined' ? caches.default : null;
+  const cacheKey = new Request(url, { method: 'GET' });
+  if (cache) {
+    try {
+      const hit = await cache.match(cacheKey);
+      if (hit) return await hit.json();
+    } catch (_) { /* 缓存不可用则退化为直连 */ }
+  }
+  const resp = await fetch(url, { headers: { 'X-Store-Key': env.STORE_KEY } });
   if (!resp.ok) return null;
-  return await resp.json();
+  const data = await resp.json();
+  if (cache) {
+    try {
+      const body = JSON.stringify(data);
+      const cached = new Response(body, {
+        headers: {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Cache-Control': 'public, max-age=600',
+        },
+      });
+      await cache.put(cacheKey, cached);
+    } catch (_) { /* 写缓存失败不影响本次返回 */ }
+  }
+  return data;
 }
 
 async function fetchTgFile(fileId, filePath, env) {
