@@ -52,11 +52,27 @@ async function handleUpload(request, env) {
       });
       const data = await resp.json();
       if (!data.ok) throw new Error(data.description || 'TG API error');
-      const r = data.result;
-      let fi;
-      if (r.photo) fi = r.photo.reduce((a, b) => a.file_size > b.file_size ? a : b);
-      else fi = r.video || r.animation || r.document || r.audio;
-      if (!fi) throw new Error('unexpected response');
+      const r = data.result || {};
+      let fi = pickFile(r);
+      if (!fi && m.method !== 'sendDocument') {
+        // 兜底：TG 对某些格式（如 WebP 走 animation）会静默退回 document，改用 sendDocument 重发
+        const docFd = new FormData();
+        docFd.append('chat_id', env.CHAT_ID);
+        docFd.append('document', file, m.outName);
+        const resp2 = await fetch(base + '/bot' + env.BOT_TOKEN + '/sendDocument', {
+          method: 'POST', body: docFd
+        });
+        const data2 = await resp2.json();
+        if (!data2.ok) throw new Error(data2.description || 'TG API error');
+        const r2 = data2.result || {};
+        const fi2 = pickFile(r2);
+        if (!fi2) throw new Error('unexpected response (fields: ' + Object.keys(r2).join(',') + ')');
+        // 用 sendDocument 的结果覆盖后续逻辑
+        r.document = r2.document;
+        r.message_id = r2.message_id;
+        fi = fi2;
+      }
+      if (!fi) throw new Error('unexpected response (fields: ' + Object.keys(r).join(',') + ')');
       let filePath = null;
       try {
         const fr = await fetch(base + '/bot' + env.BOT_TOKEN + '/getFile?file_id=' + fi.file_id);
@@ -66,7 +82,8 @@ async function handleUpload(request, env) {
       // 提取缩略图（图片/视频 TG 自动生成）
       let thumbFid = null, thumbFp = null, thumbMid = null;
       const thumb = (r.photo ? r.photo.reduce((a, b) => a.file_size < b.file_size ? a : b) : null)
-        || (r.video && r.video.thumb) || (r.animation && r.animation.thumb);
+        || (r.video && r.video.thumb) || (r.animation && r.animation.thumb)
+        || (r.document && r.document.thumb) || (r.sticker && r.sticker.thumb);
       if (thumb && thumb.file_id) {
         thumbFid = thumb.file_id;
         try {
@@ -237,13 +254,26 @@ async function handleDelete(fileId, request, env) {
 
 // ===================== HELPERS =====================
 function resolveMethod(mime, ext, origName) {
-  if (ext === 'gif' || ext === 'webp')
-    return { method: 'sendAnimation', typeName: 'animation', outName: (origName && /\.(gif|webp)$/i.test(origName)) ? origName : ((ext === 'gif' ? 'a.gif' : 'a.webp').replace(/\.\w+$/, '.jpeg')) };
+  const keep = (origName && /\.\w+$/.test(origName)) ? origName : null;
+  // GIF 是合法的 animation；WebP 不是（TG 会存成 document，导致取不到 animation 字段）
+  if (ext === 'gif')
+    return { method: 'sendAnimation', typeName: 'animation', outName: keep || 'a.gif' };
+  if (ext === 'webp')
+    return { method: 'sendDocument', typeName: 'document', outName: keep || 'f.webp' };
   if (mime.startsWith('video/'))
     return { method: 'sendVideo', typeName: 'video', outName: (origName && /\.\w+$/.test(origName)) ? origName : 'v.mp4' };
   if (mime.startsWith('audio/'))
     return { method: 'sendAudio', typeName: 'audio', outName: (origName && /\.\w+$/.test(origName)) ? origName : 'a.mp3' };
   return { method: 'sendDocument', typeName: 'document', outName: (origName && /\.\w+$/.test(origName)) ? origName : ('f.' + ext) };
+}
+
+/** 从 TG 返回的 message 里挑出实际存储的文件对象（photo 取最大分辨率） */
+function pickFile(r) {
+  if (!r) return null;
+  if (Array.isArray(r.photo) && r.photo.length)
+    return r.photo.reduce((a, b) => ((b.file_size || 0) > (a.file_size || 0) ? b : a));
+  return r.video || r.animation || r.document || r.audio
+    || r.voice || r.video_note || r.sticker || r.animation || null;
 }
 
 async function fetchManifest(fileId, env) {

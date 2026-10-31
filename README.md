@@ -108,6 +108,6 @@ wrangler deploy
 ## 注意事项
 
 - 单文件上限 700MB（免费档子请求限制）
-- GIF/WebP 会自动转 sendAnimation（避免 TG 转码）
+- GIF 走 sendAnimation（避免 TG 转码）；**WebP 走 sendDocument**（TG 不接受 animation 形式的 WebP，会退回 document 导致取不到结果，报 `unexpected response`）
 - 分片响应不走边缘缓存（CDN 对 Range 缓存不可靠）
 - Bot 被封 = 文件全灭，重要内容建议双写备份
