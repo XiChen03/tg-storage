@@ -16,6 +16,8 @@ export default {
         res = await handleUpload(request, env);
       else if (path.startsWith('/f/') && (request.method === 'GET' || request.method === 'HEAD'))
         res = await handleDownload(path.substring(3), request, env);
+      else if (path === '/del-batch' && request.method === 'POST')
+        res = await handleDeleteBatch(request, env);
       else if (path.startsWith('/del/') && request.method === 'DELETE')
         res = await handleDelete(path.substring(5), request, env);
       else
@@ -226,6 +228,31 @@ async function handleDownload(fileId, request, env) {
 }
 
 // ===================== DELETE =====================
+async function deleteMessages(msgIds, env) {
+  const base = env.TG_API_URL || 'https://api.telegram.org';
+  const results = [];
+  // TG 没有批量删除 API，但并发发送可以基本消除串行等待
+  const CONC = 8;
+  for (let i = 0; i < msgIds.length; i += CONC) {
+    const slice = msgIds.slice(i, i + CONC);
+    const part = await Promise.all(slice.map(async (mid) => {
+      try {
+        const resp = await fetch(base + '/bot' + env.BOT_TOKEN + '/deleteMessage', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: env.CHAT_ID, message_id: parseInt(mid) })
+        });
+        const d = await resp.json();
+        return { message_id: parseInt(mid), ok: d.ok };
+      } catch (e) {
+        return { message_id: parseInt(mid), ok: false, error: e.message };
+      }
+    }));
+    for (const r of part) results.push(r);
+  }
+  return results;
+}
+
 async function handleDelete(fileId, request, env) {
   if (request.headers.get('X-Store-Key') !== env.STORE_KEY)
     return json({ error: 'unauthorized' }, 401);
@@ -234,22 +261,26 @@ async function handleDelete(fileId, request, env) {
   const url = new URL(request.url);
   const msgIds = (url.searchParams.get('msgIds') || '').split(',').filter(Boolean);
   if (!msgIds.length) return json({ error: 'no msgIds' }, 400);
-  const base = env.TG_API_URL || 'https://api.telegram.org';
-  const results = [];
-  for (const mid of msgIds) {
-    try {
-      const resp = await fetch(base + '/bot' + env.BOT_TOKEN + '/deleteMessage', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: env.CHAT_ID, message_id: parseInt(mid) })
-      });
-      const d = await resp.json();
-      results.push({ message_id: parseInt(mid), ok: d.ok });
-    } catch (e) {
-      results.push({ message_id: parseInt(mid), ok: false, error: e.message });
-    }
+  return json({ ok: true, results: await deleteMessages(msgIds, env) });
+}
+
+/** POST /del-batch  { items: [{ id, msgIds: [..] }, ...] } —— 一次请求清理多个清单 */
+async function handleDeleteBatch(request, env) {
+  if (request.headers.get('X-Store-Key') !== env.STORE_KEY)
+    return json({ error: 'unauthorized' }, 401);
+  let body;
+  try { body = await request.json(); } catch (e) { return json({ error: 'bad json' }, 400); }
+  const items = (body && body.items) || [];
+  if (!Array.isArray(items) || !items.length) return json({ error: 'no items' }, 400);
+  // 汇总所有消息 id 一次性并发删除
+  const all = [];
+  for (const it of items) {
+    if (!it || typeof it.id !== 'string' || it.id.includes('..')) continue;
+    for (const mid of (it.msgIds || [])) all.push(mid);
   }
-  return json({ ok: true, results: results });
+  const results = all.length ? await deleteMessages(all, env) : [];
+  const okCount = results.filter(r => r.ok).length;
+  return json({ ok: true, total: all.length, deleted: okCount, results: results });
 }
 
 // ===================== HELPERS =====================
