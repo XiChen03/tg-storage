@@ -14,6 +14,8 @@ export default {
       let res;
       if (path === '/upload' && request.method === 'POST')
         res = await handleUpload(request, env);
+      else if (path === '/upload-raw' && request.method === 'POST')
+        res = await handleUploadRaw(request, env);
       else if (path.startsWith('/f/') && (request.method === 'GET' || request.method === 'HEAD'))
         res = await handleDownload(path.substring(3), request, env);
       else if (path === '/del-batch' && request.method === 'POST')
@@ -144,6 +146,136 @@ async function handleUpload(request, env) {
   const body = { error: 'upload failed: ' + (lastErr ? lastErr.message : 'unknown') };
   if (lastRetryAfter > 0) { body.rateLimited = true; body.retryAfter = lastRetryAfter; }
   return json(body, lastRetryAfter > 0 ? 429 : 500);
+}
+
+/**
+ * POST /upload-raw —— 原始二进制直传（前端发 application/octet-stream）。
+ *
+ * 为什么不复用 handleUpload：那条路径要 await request.formData() 把整个分片
+ * 解析成 multipart 对象，再 new FormData() 重新组装。这两步都是 CPU 密集
+ * 操作，在 Cloudflare Free 的 10ms CPU 预算下很容易被强制终止——表现为浏览器
+ * 收到一个不带 CORS 头的 503（请求根本没跑完）。
+ *
+ * 这里完全不碰 body：从请求头取文件名，直接把 request.body 流式转发给 Telegram，
+ * CPU 占用几乎为零，也不会把整片内容读进内存。
+ *
+ * 请求头：X-Store-Key（密钥）/ X-File-Name（URL 编码文件名，决定 TG 接口）/ Content-Type
+ */
+async function handleUploadRaw(request, env) {
+  if (request.headers.get('X-Store-Key') !== env.STORE_KEY)
+    return json({ error: 'unauthorized' }, 401);
+  if (!request.body) return json({ error: 'no body' }, 400);
+
+  const rawName = request.headers.get('X-File-Name') || 'file.bin';
+  let origName;
+  try { origName = decodeURIComponent(rawName); } catch (_) { origName = rawName; }
+  origName = String(origName).replace(/[\\/\r\n]+/g, '_') || 'file.bin';
+
+  const ext = origName.split('.').pop().toLowerCase();
+  const mime = request.headers.get('Content-Type') || 'application/octet-stream';
+  const m = resolveMethod(mime, ext, origName);
+  const total = parseInt(request.headers.get('Content-Length') || '0', 10) || 0;
+
+  const base = env.TG_API_URL || 'https://api.telegram.org';
+  const MAX_RETRIES = env.UPLOAD_RETRIES ? (parseInt(env.UPLOAD_RETRIES, 10) || MAX_RETRIES_DEFAULT) : MAX_RETRIES_DEFAULT;
+
+  // multipart 的头尾自己拼（几百字节），body 本体用流拼接，不复制内容
+  const boundary = '----tgstore' + Date.now().toString(16) + Math.random().toString(16).slice(2, 10);
+  const encName = origName.replace(/["\r\n]/g, '_');
+  const head = '--' + boundary + '\r\n'
+    + 'Content-Disposition: form-data; name="chat_id"\r\n\r\n'
+    + env.CHAT_ID + '\r\n'
+    + '--' + boundary + '\r\n'
+    + 'Content-Disposition: form-data; name="' + m.typeName + '"; filename="' + encName + '"\r\n'
+    + 'Content-Type: ' + mime + '\r\n\r\n';
+  const tail = '\r\n--' + boundary + '--\r\n';
+  const headBytes = new TextEncoder().encode(head);
+  const tailBytes = new TextEncoder().encode(tail);
+
+  // 原始 body 是一次性的：首次尝试纯流式转发；重试时已耗尽，需先缓冲到内存
+  let cached = null;
+  let lastErr = null, lastRetryAfter = 0;
+  for (let i = 0; i < MAX_RETRIES; i++) {
+    try {
+      let bodyStream;
+      if (cached) {
+        const all = new Uint8Array(headBytes.length + cached.length + tailBytes.length);
+        all.set(headBytes, 0);
+        all.set(cached, headBytes.length);
+        all.set(tailBytes, headBytes.length + cached.length);
+        bodyStream = all;
+      } else {
+        bodyStream = new ReadableStream({
+          start(controller) { controller.enqueue(headBytes); },
+          async pull(controller) {
+            const reader = request.body.getReader();
+            let r;
+            while (!(r = await reader.read()).done) controller.enqueue(r.value);
+            controller.enqueue(tailBytes);
+            controller.close();
+          },
+          cancel(reason) { try { request.body.cancel(reason); } catch (_) {} },
+        });
+      }
+      const resp = await fetch(base + '/bot' + env.BOT_TOKEN + '/' + m.method, {
+        method: 'POST',
+        headers: { 'Content-Type': 'multipart/form-data; boundary=' + boundary },
+        body: bodyStream,
+        duplex: 'half',
+      });
+      const data = await resp.json();
+      if (!data.ok) {
+        const ra = tgRetryAfter(data);
+        const desc = data.description || 'TG API error';
+        if (ra > 0 || isTgRateLimited(desc)) {
+          lastRetryAfter = ra || 5;
+          lastErr = new Error(desc);
+          if (i < MAX_RETRIES - 1) { await sleep(lastRetryAfter * 1000 + 500); continue; }
+          return json({ error: 'rate limited: ' + desc, rateLimited: true, retryAfter: lastRetryAfter }, 429);
+        }
+        throw new Error(desc);
+      }
+      const r = data.result || {};
+      const fi = pickFile(r);
+      if (!fi) throw new Error('unexpected response (fields: ' + Object.keys(r).join(',') + ')');
+
+      let filePath = null;
+      try {
+        const fr = await fetch(base + '/bot' + env.BOT_TOKEN + '/getFile?file_id=' + fi.file_id);
+        const fd2 = await fr.json();
+        if (fd2.ok) filePath = fd2.result.file_path;
+      } catch (_) {}
+
+      let thumbFid = null, thumbFp = null;
+      const thumb = (r.photo ? r.photo.reduce((a, b) => a.file_size < b.file_size ? a : b) : null)
+        || (r.video && r.video.thumb) || (r.animation && r.animation.thumb)
+        || (r.document && r.document.thumb) || (r.sticker && r.sticker.thumb);
+      if (thumb && thumb.file_id) {
+        thumbFid = thumb.file_id;
+        try {
+          const tfr = await fetch(base + '/bot' + env.BOT_TOKEN + '/getFile?file_id=' + thumbFid);
+          const tfd = await tfr.json();
+          if (tfd.ok) thumbFp = tfd.result.file_path;
+        } catch (_) {}
+      }
+
+      const out = {
+        ok: true, file_id: fi.file_id, file_path: filePath,
+        message_id: r.message_id, mime: mime,
+        filename: origName, size: fi.file_size || total,
+      };
+      if (thumbFid) { out.thumb_fid = thumbFid; out.thumb_fp = thumbFp; }
+      return json(out);
+    } catch (e) {
+      lastErr = e;
+      // 首次失败：把还没读完的原始 body 收进内存，供后续重试复用
+      if (!cached) {
+        try { cached = new Uint8Array(await new Response(request.body).arrayBuffer()); } catch (_) {}
+      }
+      if (i < MAX_RETRIES - 1) await sleep(1000 * (i + 1));
+    }
+  }
+  return json({ error: 'upload failed: ' + (lastErr ? lastErr.message : 'unknown') }, 500);
 }
 
 // ===================== DOWNLOAD =====================
