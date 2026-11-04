@@ -205,16 +205,18 @@ async function handleUploadRaw(request, env) {
         all.set(tailBytes, headBytes.length + cached.length);
         bodyStream = all;
       } else {
+        // reader 必须在闭包里只创建一次：每次 pull 都 getReader() 会在流被锁定后抛错，
+        // 表现为上传中途断流（浏览器侧看到的是没有 CORS 头的 5xx）
+        const reader = request.body.getReader();
+        let first = true;
         bodyStream = new ReadableStream({
-          start(controller) { controller.enqueue(headBytes); },
           async pull(controller) {
-            const reader = request.body.getReader();
-            let r;
-            while (!(r = await reader.read()).done) controller.enqueue(r.value);
-            controller.enqueue(tailBytes);
-            controller.close();
+            if (first) { first = false; controller.enqueue(headBytes); return; }
+            const r = await reader.read();
+            if (r.done) { controller.enqueue(tailBytes); controller.close(); return; }
+            controller.enqueue(r.value);
           },
-          cancel(reason) { try { request.body.cancel(reason); } catch (_) {} },
+          cancel(reason) { try { reader.cancel(reason); } catch (_) {} },
         });
       }
       const resp = await fetch(base + '/bot' + env.BOT_TOKEN + '/' + m.method, {
@@ -309,21 +311,22 @@ async function handleDownload(fileId, request, env) {
   if (chunks.length <= 1) {
     const fid = chunks.length === 1 ? chunks[0].fid : manifest.file_id;
     const fp = chunks.length === 1 ? chunks[0].filePath : manifest.file_path;
-    const buf = await fetchTgFile(fid, fp, env);
-    if (!buf) return json({ error: 'fetch failed' }, 500);
+    // 全程走流，不做 arrayBuffer：20MB 分片一读一裁就是两次 20MB memcpy，
+    // 单次请求的 10ms CPU 预算会被直接吃满，视频播放（大量 Range 请求）必炸
+    const src = await tgOpen(fid, fp, env, 3);
+    if (!src) return json({ error: 'fetch failed' }, 500);
     if (rng) {
-      const sliced = buf.slice(rng.start, rng.end + 1);
       const h = commonHeaders(total, mime, fname, et);
       h.set('Content-Range', 'bytes ' + rng.start + '-' + rng.end + '/' + total);
-      h.set('Content-Length', String(sliced.byteLength));
+      h.set('Content-Length', String(rng.end - rng.start + 1));
       h.set('Accept-Ranges', 'bytes');
       h.set('Cache-Control', 'private');
-      return new Response(sliced, { status: 206, headers: h });
+      return new Response(trimStream(src.body, rng.start, rng.end), { status: 206, headers: h });
     }
     const h = commonHeaders(total, mime, fname, et);
     h.set('Accept-Ranges', 'bytes');
     h.set('Cache-Control', 'public, max-age=31536000, immutable');
-    return new Response(buf, { status: 200, headers: h });
+    return new Response(src.body, { status: 200, headers: h });
   }
   const stream = new ReadableStream({
     async start(controller) {
@@ -364,18 +367,27 @@ async function handleDownload(fileId, request, env) {
           while (cursor < needed.length && pending.size < CONC) {
             const idx = cursor++;
             const c = needed[idx].c;
-            pending.set(idx, fetchTgFileWithRetry(c.fid, c.filePath, env, 3));
+            pending.set(idx, tgOpen(c.fid, c.filePath, env, 3));
           }
         };
         fill();
         for (let i = 0; i < needed.length; i++) {
-          const buf = await pending.get(i);
+          const src = await pending.get(i);
           pending.delete(i);
           fill();
-          if (!buf) throw new Error('chunk ' + (needed[i].c.index != null ? needed[i].c.index : '?') + ' failed');
+          if (!src) throw new Error('chunk ' + (needed[i].c.index != null ? needed[i].c.index : '?') + ' failed');
           const s = rng ? Math.max(0, rng.start - needed[i].pos) : 0;
-          const e = rng ? Math.min(buf.byteLength, rng.end - needed[i].pos + 1) : buf.byteLength;
-          if (s < e) controller.enqueue(buf.slice(s, e));
+          // src.size 来自上游 Content-Length，可能缺省为 0；此时不裁剪右边界
+          const limit = src.size > 0 ? src.size : Infinity;
+          const e = rng ? Math.min(limit, rng.end - needed[i].pos + 1) : limit;
+          if (s < e) {
+            const reader = trimStream(src.body, s, e - 1).getReader();
+            for (;;) {
+              const rr = await reader.read();
+              if (rr.done) break;
+              controller.enqueue(rr.value);
+            }
+          }
         }
         controller.close();
       } catch (err) { controller.error(err); }
@@ -503,30 +515,71 @@ async function fetchManifest(fileId, env) {
   return data;
 }
 
-async function fetchTgFile(fileId, filePath, env) {
+/**
+ * 打开 TG 文件并拿到「流」，不把内容读进内存。
+ *
+ * 旧实现用 arrayBuffer() 整段缓冲再 slice()，20MB 分片就是两次 20MB 拷贝，
+ * 在 Workers Free 的 10ms CPU 预算里必然被强杀——重视频库（大量 Range 拉流）
+ * 就是这么把 CPU 配额烧光的。改成直接返回上游 body 流，CPU 占用趋近于零。
+ */
+async function tgOpen(fileId, filePath, env, retries) {
   const base = env.TG_API_URL || 'https://api.telegram.org';
-  const dl = async (fp) => {
-    const r = await fetch(base + '/file/bot' + env.BOT_TOKEN + '/' + fp);
-    if (!r.ok) return null;
-    return new Uint8Array(await r.arrayBuffer());
-  };
-  let fp = filePath;
-  if (fp) { const b = await dl(fp); if (b) return b; }
-  // 缓存的 file_path 失效/为空 → 强制重新 getFile 获取新路径
-  const r = await fetch(base + '/bot' + env.BOT_TOKEN + '/getFile?file_id=' + fileId);
-  const d = await r.json();
-  if (!d.ok) return null;
-  return await dl(d.result.file_path);
-}
-
-async function fetchTgFileWithRetry(fileId, filePath, env, retries) {
-  for (let i = 0; i < retries; i++) {
-    const buf = await fetchTgFile(fileId, filePath, env);
-    if (buf) return buf;
-    if (i < retries - 1) await sleep(500 * (i + 1));
+  const tries = retries || 1;
+  for (let i = 0; i < tries; i++) {
+    let r = null;
+    if (filePath) {
+      try { r = await fetch(base + '/file/bot' + env.BOT_TOKEN + '/' + filePath); } catch (_) { r = null; }
+      if (r && r.ok) return { body: r.body, size: parseInt(r.headers.get('Content-Length') || '0', 10) || 0 };
+    }
+    // 缓存的 file_path 失效/为空 → 强制重新 getFile 拿新路径
+    try {
+      const fr = await fetch(base + '/bot' + env.BOT_TOKEN + '/getFile?file_id=' + fileId);
+      const d = await fr.json();
+      if (d && d.ok && d.result && d.result.file_path) {
+        filePath = d.result.file_path;
+        const r2 = await fetch(base + '/file/bot' + env.BOT_TOKEN + '/' + filePath);
+        if (r2.ok) return { body: r2.body, size: parseInt(r2.headers.get('Content-Length') || '0', 10) || 0 };
+      }
+    } catch (_) {}
+    if (i < tries - 1) await sleep(500 * (i + 1));
   }
   return null;
 }
+
+/** 把流裁剪到 [start, end] 字节区间，逐块转发，不复制整段 */
+function trimStream(body, start, end) {
+  if (!body) return new ReadableStream({ start(c) { c.close(); } });
+  let pos = 0;
+  const reader = body.getReader();
+  return new ReadableStream({
+    async pull(controller) {
+      for (;;) {
+        const r = await reader.read();
+        if (r.done) { controller.close(); return; }
+        const v = r.value;
+        const vStart = pos;
+        const vEnd = pos + v.byteLength - 1;
+        pos += v.byteLength;
+        if (vEnd < start) continue;              // 整块都在区间前，丢弃
+        if (vStart > end) { controller.close(); try { reader.cancel(); } catch (_) {} return; }
+        const s = Math.max(0, start - vStart);
+        const e = Math.min(v.byteLength, end - vStart + 1);
+        controller.enqueue(s === 0 && e === v.byteLength ? v : v.subarray(s, e));
+        return;
+      }
+    },
+    cancel(reason) { try { reader.cancel(reason); } catch (_) {} },
+  });
+}
+
+async function fetchTgFile(fileId, filePath, env) {
+  // 缩略图用（几十 KB），整段缓冲没问题
+  const src = await tgOpen(fileId, filePath, env, 3);
+  if (!src) return null;
+  return new Uint8Array(await new Response(src.body).arrayBuffer());
+}
+
+
 
 function parseRange(header, total) {
   if (!header || total <= 0) return null;
