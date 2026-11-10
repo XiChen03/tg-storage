@@ -8,6 +8,9 @@ export default {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type, X-Store-Key, If-None-Match, Range',
+      // Content-Range / Accept-Ranges 不在 CORS 默认可读清单里，跨域（xywm.org → tg.xywm.org）
+      // 时前端读不到它们，就没法判断总长与分段是否对齐，必须显式暴露
+      'Access-Control-Expose-Headers': 'Content-Range, Content-Length, Accept-Ranges, ETag, X-File-Size',
     };
     if (request.method === 'OPTIONS') return new Response(null, { headers: CORS });
     try {
@@ -281,12 +284,52 @@ async function handleUploadRaw(request, env) {
 }
 
 // ===================== DOWNLOAD =====================
+/**
+ * 把 manifest 的 chunks 展开成绝对字节区间。
+ * 老清单可能缺 size，缺 size 时按「整文件一块」处理，避免区间算错。
+ */
+function buildLayout(chunks, total) {
+  const out = [];
+  if (!chunks || !chunks.length) return out;
+  const sized = chunks.every(c => typeof c.size === 'number' && c.size >= 0);
+  let pos = 0;
+  for (let i = 0; i < chunks.length; i++) {
+    const c = chunks[i] || {};
+    const size = sized ? c.size : (i === 0 ? total : 0);
+    out.push({
+      index: c.index != null ? c.index : i,
+      fid: c.fid,
+      filePath: c.filePath || null,
+      start: pos,
+      end: pos + size - 1,
+      size: size,
+    });
+    pos += size;
+  }
+  return out;
+}
+
+/**
+ * 文件下载 —— 核心约束：Cloudflare 会在约 60 秒时掐断仍在传输的响应。
+ *
+ * 199MB 的文件按实测约 1.2MB/s 需要 160 秒以上，所以「一个请求整包推完」
+ * 在任何情况下都不可能成功，只会得到「头里写了 199MB、实际几 MB 就断」的
+ * 半截响应（下载器据此判定失败）。因此：
+ *
+ *   1. 每个响应都有明确的字节区间，超过 DOWNLOAD_MAX_MB（默认 20MB）
+ *      就按分片边界截断，回 206 + 精确的 Content-Range，客户端用 Range 续取；
+ *   2. 绝不再出现「声明全长却只发一部分」的响应；
+ *   3. ?info=1 返回分片布局，客户端可据此做进度与断点续传；
+ *   4. 传输中若某片短读，直接 error 掉流，让客户端明确失败并重试那一段，
+ *      而不是悄悄交付一个损坏的文件。
+ */
 async function handleDownload(fileId, request, env) {
   if (!fileId || fileId.includes('..') || fileId.includes('/') || fileId.includes('\\'))
     return json({ error: 'invalid id' }, 400);
   const manifest = await fetchManifest(fileId, env);
   if (!manifest) return json({ error: 'not found' }, 404);
   const url = new URL(request.url);
+
   const wantThumb = url.searchParams.get('thumb') === '1';
   if (wantThumb && manifest.thumb_fid) {
     const buf = await fetchTgFile(manifest.thumb_fid, manifest.thumb_fp, env);
@@ -297,111 +340,102 @@ async function handleDownload(fileId, request, env) {
     h.set('Content-Length', String(buf.byteLength));
     return new Response(buf, { status: 200, headers: h });
   }
+
   const total = manifest.size || 0;
   const mime = manifest.mime || 'application/octet-stream';
   const fname = encodeURIComponent(manifest.filename || fileId);
   const et = makeEtag(manifest);
+  const chunks = manifest.chunks || [];
+  const layout = buildLayout(chunks, total);
+
+  // 分片布局：前端据此规划 Range 请求、显示进度、断点续传
+  if (url.searchParams.get('info') === '1') {
+    return json({
+      ok: true,
+      size: total,
+      mime: manifest.mime || 'application/octet-stream',
+      filename: manifest.filename || fileId,
+      etag: et,
+      chunks: layout.map(c => ({ index: c.index, start: c.start, end: c.end, size: c.size })),
+    }, 200, { 'Cache-Control': 'private, max-age=60' });
+  }
+
   if (request.method === 'HEAD')
     return new Response(null, { status: 200, headers: commonHeaders(total, mime, fname, et) });
   const ifNM = request.headers.get('If-None-Match');
   if (ifNM && ifNM === et)
-    return new Response(null, { status: 304, headers: { 'ETag': et, 'Cache-Control': 'public, max-age=31536000' } });
-  let rng = parseRange(request.headers.get('Range'), total);
-  const chunks = manifest.chunks || [];
-  if (chunks.length <= 1) {
-    const fid = chunks.length === 1 ? chunks[0].fid : manifest.file_id;
-    const fp = chunks.length === 1 ? chunks[0].filePath : manifest.file_path;
-    // 全程走流，不做 arrayBuffer：20MB 分片一读一裁就是两次 20MB memcpy，
-    // 单次请求的 10ms CPU 预算会被直接吃满，视频播放（大量 Range 请求）必炸
-    const src = await tgOpen(fid, fp, env, 3);
-    if (!src) return json({ error: 'fetch failed' }, 500);
-    if (rng) {
-      const h = commonHeaders(total, mime, fname, et);
-      h.set('Content-Range', 'bytes ' + rng.start + '-' + rng.end + '/' + total);
-      h.set('Content-Length', String(rng.end - rng.start + 1));
-      h.set('Accept-Ranges', 'bytes');
-      h.set('Cache-Control', 'private');
-      return new Response(trimStream(src.body, rng.start, rng.end), { status: 206, headers: h });
-    }
-    const h = commonHeaders(total, mime, fname, et);
-    h.set('Accept-Ranges', 'bytes');
-    h.set('Cache-Control', 'public, max-age=31536000, immutable');
-    return new Response(src.body, { status: 200, headers: h });
-  }
+    return new Response(null, { status: 304, headers: { 'ETag': et, 'Cache-Control': 'private' } });
+
+  // 单次响应的字节预算：一篇 20MB 实测约需 17s，安全地留在 60s 掐断线以内
+  const MAXB = Math.min(64, Math.max(2, parseInt(env.DOWNLOAD_MAX_MB, 10) || 20)) * 1024 * 1024;
+  const want = parseRange(request.headers.get('Range'), total) || { start: 0, end: total - 1 };
+  const parts = layout.length ? layout
+    : [{ index: 0, fid: manifest.file_id, filePath: manifest.file_path || null,
+         start: 0, end: total - 1, size: total }];
+  const rng = { start: want.start, end: Math.max(want.start, Math.min(want.end, want.start + MAXB - 1, total - 1)) };
+  const full = rng.start === 0 && rng.end >= total - 1;
+
+  // 本次响应覆盖到的分片
+  const need = parts.filter(c => c.end >= rng.start && c.start <= rng.end);
+
   const stream = new ReadableStream({
     async start(controller) {
       try {
-        let pos = 0;
-        const sized = chunks.every(c => typeof c.size === 'number' && c.size >= 0);
-        const hasPath = chunks.every(c => c.filePath);
-        // 收集需要的分片
-        const needed = [];
-        for (const c of chunks) {
-          if (rng) {
-            if (sized) {
-              const cStart = pos, cEnd = cStart + c.size - 1;
-              if (cEnd < rng.start || cStart > rng.end) { pos += c.size; continue; }
-              if (pos > rng.end) break;
-            } else if (pos > rng.end) break;
-          }
-          needed.push({ c: c, pos: pos });
-          pos += (typeof c.size === 'number') ? c.size : 0;
-        }
-        // 子请求预算：单次调用最多取 MAXC 片（50 上限 - manifest - 重试余量），
-        // 超出则在本片边界截断，以 206 Partial Content 返回；浏览器/下载器会
-        // 自动携带后续 Range 请求继续取，等效无感分页
-        const MAXC = env.DOWNLOAD_MAX_CHUNKS ? Math.max(5, Math.min(48, parseInt(env.DOWNLOAD_MAX_CHUNKS, 10) || 45)) : 45;
-        if (sized && needed.length > MAXC) {
-          if (!rng) rng = { start: 0, end: total - 1 };
-          const cutEnd = needed[MAXC - 1].pos + needed[MAXC - 1].c.size - 1;
-          rng = { start: rng.start, end: Math.min(rng.end, cutEnd) };
-          needed.length = MAXC;
-        }
-        // 滑动窗口流水线：最多 CONC 片在途，取到一片立即写入流并释放，
-        // 内存峰值恒定（约4片），不会像整段缓冲那样撑爆 128MB 内存上限；
-        // 老清单无 filePath 时每片要先 getFile，退化串行避免子请求翻倍
-        const CONC = hasPath ? 4 : 1;
+        const CONC = Math.min(4, Math.max(1, need.length));
         const pending = new Map();
         let cursor = 0;
         const fill = () => {
-          while (cursor < needed.length && pending.size < CONC) {
-            const idx = cursor++;
-            const c = needed[idx].c;
-            pending.set(idx, tgOpen(c.fid, c.filePath, env, 3));
+          while (cursor < need.length && pending.size < CONC) {
+            const i = cursor++;
+            const c = need[i];
+            const s = Math.max(0, rng.start - c.start);
+            const e = Math.min(c.size, rng.end - c.start + 1) - 1;
+            pending.set(i, tgOpen(c.fid, c.filePath, env, 3, { start: s, end: e }));
           }
         };
         fill();
-        for (let i = 0; i < needed.length; i++) {
+        const expect = rng.end - rng.start + 1;
+        let emitted = 0;
+        for (let i = 0; i < need.length; i++) {
           const src = await pending.get(i);
           pending.delete(i);
           fill();
-          if (!src) throw new Error('chunk ' + (needed[i].c.index != null ? needed[i].c.index : '?') + ' failed');
-          const s = rng ? Math.max(0, rng.start - needed[i].pos) : 0;
-          // src.size 来自上游 Content-Length，可能缺省为 0；此时不裁剪右边界
-          const limit = src.size > 0 ? src.size : Infinity;
-          const e = rng ? Math.min(limit, rng.end - needed[i].pos + 1) : limit;
-          if (s < e) {
-            const reader = trimStream(src.body, s, e - 1).getReader();
-            for (;;) {
-              const rr = await reader.read();
-              if (rr.done) break;
-              controller.enqueue(rr.value);
-            }
+          if (!src) throw new Error('chunk ' + need[i].index + ' failed');
+          const c = need[i];
+          const s = Math.max(0, rng.start - c.start);
+          const e = Math.min(c.size, rng.end - c.start + 1) - 1;
+          const needBytes = e - s + 1;
+          // 上游按 Range 返回 206 时 body 已经是目标片段；否则自己裁
+          const body = src.partial ? src.body : trimStream(src.body, s, e);
+          const reader = body.getReader();
+          let got = 0;
+          for (;;) {
+            const rr = await reader.read();
+            if (rr.done) break;
+            controller.enqueue(rr.value);
+            got += rr.value.byteLength;
           }
+          emitted += got;
+          // 短读必须显式失败：宁可让客户端重试这段，也不能交付错位的字节
+          if (got !== needBytes) throw new Error('chunk ' + c.index + ' short: ' + got + '/' + needBytes);
         }
+        if (emitted !== expect) throw new Error('short response: ' + emitted + '/' + expect);
         controller.close();
       } catch (err) { controller.error(err); }
     }
   });
+
   const h = commonHeaders(total, mime, fname, et);
   h.set('Accept-Ranges', 'bytes');
-  h.set('Cache-Control', 'private');
-  if (rng) {
-    h.set('Content-Range', 'bytes ' + rng.start + '-' + rng.end + '/' + total);
-    h.set('Content-Length', String(rng.end - rng.start + 1));
-    return new Response(stream, { status: 206, headers: h });
+  h.set('Cache-Control', full ? 'public, max-age=31536000, immutable' : 'private');
+  h.set('X-File-Size', String(total));
+  if (full) {
+    h.set('Content-Length', String(total));
+    return new Response(stream, { status: 200, headers: h });
   }
-  return new Response(stream, { status: 200, headers: h });
+  h.set('Content-Range', 'bytes ' + rng.start + '-' + rng.end + '/' + total);
+  h.set('Content-Length', String(rng.end - rng.start + 1));
+  return new Response(stream, { status: 206, headers: h });
 }
 
 // ===================== DELETE =====================
@@ -522,23 +556,38 @@ async function fetchManifest(fileId, env) {
  * 在 Workers Free 的 10ms CPU 预算里必然被强杀——重视频库（大量 Range 拉流）
  * 就是这么把 CPU 配额烧光的。改成直接返回上游 body 流，CPU 占用趋近于零。
  */
-async function tgOpen(fileId, filePath, env, retries) {
+async function tgOpen(fileId, filePath, env, retries, range) {
   const base = env.TG_API_URL || 'https://api.telegram.org';
   const tries = retries || 1;
+  // 把浏览器的 Range 透传给 Telegram：只取这一小段，而不是整个 20MB 分片。
+  // 这是起播速度和子请求数量的关键——不传 Range 的话，为了给播放器 1 个字节，
+  // Worker 也得把整片 20MB 拖下来。
+  const hdrs = {};
+  if (range) hdrs['Range'] = 'bytes=' + range.start + '-' + range.end;
+  const attempt = async (fp) => {
+    try {
+      const r = await fetch(base + '/file/bot' + env.BOT_TOKEN + '/' + fp, { headers: hdrs });
+      if (!r.ok) return null;
+      return {
+        body: r.body,
+        size: parseInt(r.headers.get('Content-Length') || '0', 10) || 0,
+        partial: r.status === 206,
+        // 上游没按 Range 裁剪时，这里的 Content-Range 可用来校准
+        contentRange: r.headers.get('Content-Range') || null,
+      };
+    } catch (_) { return null; }
+  };
   for (let i = 0; i < tries; i++) {
-    let r = null;
-    if (filePath) {
-      try { r = await fetch(base + '/file/bot' + env.BOT_TOKEN + '/' + filePath); } catch (_) { r = null; }
-      if (r && r.ok) return { body: r.body, size: parseInt(r.headers.get('Content-Length') || '0', 10) || 0 };
-    }
+    let got = filePath ? await attempt(filePath) : null;
+    if (got) return got;
     // 缓存的 file_path 失效/为空 → 强制重新 getFile 拿新路径
     try {
       const fr = await fetch(base + '/bot' + env.BOT_TOKEN + '/getFile?file_id=' + fileId);
       const d = await fr.json();
       if (d && d.ok && d.result && d.result.file_path) {
         filePath = d.result.file_path;
-        const r2 = await fetch(base + '/file/bot' + env.BOT_TOKEN + '/' + filePath);
-        if (r2.ok) return { body: r2.body, size: parseInt(r2.headers.get('Content-Length') || '0', 10) || 0 };
+        got = await attempt(filePath);
+        if (got) return got;
       }
     } catch (_) {}
     if (i < tries - 1) await sleep(500 * (i + 1));
