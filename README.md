@@ -137,8 +137,33 @@ wrangler deploy
 
 - 单文件上限 700MB（免费档子请求限制）
 - GIF 走 sendAnimation（避免 TG 转码）；**WebP 走 sendDocument**（TG 不接受 animation 形式的 WebP，会退回 document 导致取不到结果，报 `unexpected response`）
-- 分片响应不走边缘缓存（CDN 对 Range 缓存不可靠）
+- 分片响应不写进 CF 边缘缓存（CDN 对 206 拼整包不可靠），但会给浏览器 `private, immutable`，
+  同一段重复读不再回源
 - Bot 被封 = 文件全灭，重要内容建议双写备份
+
+## 省 Cloudflare 请求配额（免费档 10 万次/天）
+
+请求数是按「Worker 被调用了几次」算的，预检 OPTIONS 也算一次。日常超标的几条大头和对应办法：
+
+| 消耗点 | 为什么会爆 | 已做的处理 |
+|---|---|---|
+| CORS 预检（OPTIONS） | 浏览器默认只缓存 5s，**每个分片上传都要先来一次 OPTIONS**，上传请求直接翻倍 | 响应加 `Access-Control-Max-Age: 86400`，一次会话只付一次 |
+| `X-File-Name` 不在白名单 | `/upload-raw` 的探测请求预检必失败 → 前端判定"没有 raw 通道"，**整个会话都退回 multipart `/upload`**。除了每次上传要多付一倍请求，multipart 解析还是 CPU 密集操作，在免费档 10ms 预算下会被强杀 | 白名单补上 `X-File-Name`，raw 快通道恢复可用 |
+| 上传能力探测 | 每次刷新图床/文件库页面探一次新版 Worker | 探测结果写 localStorage（按 Worker 地址，7 天） |
+| 播放器拖进度条 | 206 原来只给 `private` 没 max-age，每拖一次都重新来过 | 改 `immutable`，同段命中浏览器缓存 |
+| 视频列表封面 | 没有缩略图时列表里每个 `<video preload="metadata">` 都要拉文件头（一次 Range 请求）。**分片上传的视频以前一律没有缩略图**，所以上传越多的号，刷列表时烧得越狠 | 分片上传时把首片（`.c0`，仍按原 mime 走 `sendVideo`，TG 会给首帧生成 thumb）的 `thumb_fid` 一起登记进清单，列表一律用 `?thumb=1`；顺带修了缩略图响应用 `manifest.mime`（视频是 `video/mp4`）当 `Content-Type` 的问题 |
+
+上面五条都是"把该省的省掉"，剩下的量就取决于真实访问量了。想再往下降，只有三条路：
+
+1. **少让浏览器直连 Worker**。注意两个常见误区：
+   - 给 `tg.xywm.ltd` 加 Cache Everything 的 Cache Rule **不能**跳过 Worker —— Worker 路由
+     在边缘缓存之前执行，命中缓存也照样算一次调用；
+   - Workers Cache（wrangler 里 `[cache] enabled = true`）虽然缓存命中时不跑 Worker 代码、
+     不烧 CPU，但按官方定价**仍然按普通请求计费**，所以对"每天 10 万次"这个额度没有帮助。
+   真要让重复下载完全不进 Worker，只能把 `tg.` 这套直链换成不经过 Worker 的存储
+   （R2 公开桶 / 别的图床），或者在自己服务器上做一层带磁盘缓存的 `/tg/` 反代。
+2. **把图片挪去别的图床**（R2、第三方图床）。图片请求数是最大头，挪走基本就解决了。
+3. **升级 Workers Paid**（$5/月，1000 万请求/月），顺带解掉 10ms CPU 限制，最省事。
 
 ## 更新本 Worker 前务必确认「线上跑的是哪一版」
 

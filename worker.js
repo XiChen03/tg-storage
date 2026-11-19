@@ -7,10 +7,18 @@ export default {
     const CORS = {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, X-Store-Key, If-None-Match, Range',
+      // X-File-Name 必须列进来：/upload-raw 靠它传文件名。少了这一项，浏览器
+      // 会直接判定预检失败（onerror），前端只会看到"网络连接中断"，然后按网络
+      // 错误重试 3 次 —— 每次重试都是一次白跑的 OPTIONS，白白烧配额。
+      'Access-Control-Allow-Headers': 'Content-Type, X-Store-Key, X-File-Name, If-None-Match, Range',
       // Content-Range / Accept-Ranges 不在 CORS 默认可读清单里，跨域（xywm.org → tg.xywm.org）
       // 时前端读不到它们，就没法判断总长与分段是否对齐，必须显式暴露
       'Access-Control-Expose-Headers': 'Content-Range, Content-Length, Accept-Ranges, ETag, X-File-Size',
+      // 预检结果浏览器默认只缓存 5 秒（Chromium）/ 不缓存（Safari 更短），
+      // 于是「每个分片上传」都会先来一发 OPTIONS —— 上传类请求因此直接被翻倍，
+      // 这是 CF 免费档 10 万次/天最常见的爆法。允许 24h 后，
+      // 同一次会话里几十个分片只花 1 次预检。上限：Chromium 2h、Firefox 24h。
+      'Access-Control-Max-Age': '86400',
     };
     if (request.method === 'OPTIONS') return new Response(null, { headers: CORS });
     try {
@@ -335,7 +343,9 @@ async function handleDownload(fileId, request, env) {
     const buf = await fetchTgFile(manifest.thumb_fid, manifest.thumb_fp, env);
     if (!buf) return json({ error: 'thumb fetch failed' }, 504);
     const h = new Headers();
-    h.set('Content-Type', manifest.mime || 'image/jpeg');
+    // 缩略图永远是图片（JPEG/PNG），不能拿 manifest.mime 当 Content-Type ——
+    // 视频的清单里 mime 是 video/mp4，用它标注一张 JPEG 会让浏览器/播放器按视频处理。
+    h.set('Content-Type', thumbMime(manifest));
     h.set('Cache-Control', 'public, max-age=604800, immutable');
     h.set('Content-Length', String(buf.byteLength));
     return new Response(buf, { status: 200, headers: h });
@@ -427,7 +437,13 @@ async function handleDownload(fileId, request, env) {
 
   const h = commonHeaders(total, mime, fname, et);
   h.set('Accept-Ranges', 'bytes');
-  h.set('Cache-Control', full ? 'public, max-age=31536000, immutable' : 'private');
+  // 分段响应也必须带 max-age：id 是内容寻址的（一个 id 永远对应同一份字节），
+  // 重复读同一区间结果必然相同，所以浏览器缓存是安全的。原来 206 只给了
+  // 'private'（没有 max-age），浏览器每次都当成"需要重新取"，播放器每拖一次
+  // 进度条就重新来一轮 Range 请求 —— 每个 Range 都是一次 Worker 调用。
+  // 用 private 而不是 public：只让浏览器缓存，不让中间层拿 206 去拼整包。
+  h.set('Cache-Control', full ? 'public, max-age=31536000, immutable'
+                              : 'private, max-age=31536000, immutable');
   h.set('X-File-Size', String(total));
   if (full) {
     h.set('Content-Length', String(total));
@@ -507,6 +523,14 @@ function resolveMethod(mime, ext, origName) {
   if (mime.startsWith('audio/'))
     return { method: 'sendAudio', typeName: 'audio', outName: (origName && /\.\w+$/.test(origName)) ? origName : 'a.mp3' };
   return { method: 'sendDocument', typeName: 'document', outName: (origName && /\.\w+$/.test(origName)) ? origName : ('f.' + ext) };
+}
+
+/** 缩略图（TG 自动生成的 JPEG/PNG）的 Content-Type：永远不要用清单里的 mime */
+function thumbMime(manifest) {
+  const fp = String(manifest.thumb_fp || '').toLowerCase();
+  if (fp.endsWith('.png')) return 'image/png';
+  if (fp.endsWith('.webp')) return 'image/webp';
+  return 'image/jpeg';
 }
 
 /** 从 TG 返回的 message 里挑出实际存储的文件对象（photo 取最大分辨率） */
